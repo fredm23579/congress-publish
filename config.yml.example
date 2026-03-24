@@ -1,7 +1,43 @@
-# updates github repository with individual bill data
-github:
-  username: GITHUB_USER
-  password: GITHUB_PASS
+# Congress Publisher — Configuration
+# Copy this file to config.yml and fill in your values.
+# config.yml is git-ignored and should never be committed.
 
-# root data directory of congress information
-data: /path/to/congress/data
+# ---------------------------------------------------------------------------
+# GitHub settings
+# ---------------------------------------------------------------------------
+github:
+  # Personal access token with "repo" scope.
+  # Create one at: https://github.com/settings/tokens
+  # (SSH key auth is also supported — leave token blank and configure SSH.)
+  token: YOUR_GITHUB_TOKEN
+
+  # Target repository where published data will be pushed (gh-pages branch).
+  # Use SSH format:   git@github.com:YOUR_USERNAME/congress-data.git
+  # Or HTTPS format:  https://github.com/YOUR_USERNAME/congress-data.git
+  repo: git@github.com:YOUR_USERNAME/congress-data.git
+
+# ---------------------------------------------------------------------------
+# Local storage
+# ---------------------------------------------------------------------------
+# Root directory where congress data is written before publishing.
+# Must be writable and ideally on fast local storage.
+repo: /path/to/local/congress/data
+
+# ---------------------------------------------------------------------------
+# API keys  (optional but strongly recommended to avoid rate limits)
+# ---------------------------------------------------------------------------
+
+# Congress.gov API — free key: https://api.congress.gov/sign-up/
+congress_api_key: YOUR_CONGRESS_API_KEY
+
+# GovInfo API — free key: https://api.data.gov/signup/
+# govinfo_api_key: YOUR_GOVINFO_API_KEY
+
+# ---------------------------------------------------------------------------
+# Scheduling  (optional — can also be passed via --schedule flag)
+# ---------------------------------------------------------------------------
+# Uncomment one of the lines below or pass --schedule on the CLI.
+# schedule: daily       # once per day
+# schedule: 6h          # every 6 hours
+# schedule: hourly      # every hour
+# schedule: weekly      # once per week

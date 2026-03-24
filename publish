@@ -1,107 +1,530 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""
+Congress Publisher - Download and publish U.S. Congressional data to GitHub.
 
-import sys, os, glob, errno, subprocess
+Fetches bill and amendment data from official government APIs (Congress.gov v3,
+GovInfo.gov) and publishes to a GitHub repository. Supports automated scheduling
+for continuous data self-updates.
+
+Data Sources:
+  - Congress.gov API v3: https://api.congress.gov/v3  (primary)
+  - GovInfo API:         https://api.govinfo.gov       (supplemental)
+
+API keys are free:
+  - Congress.gov: https://api.congress.gov/sign-up/
+  - GovInfo:      https://api.data.gov/signup/
+"""
+
+import sys
+import os
+import json
 import shutil
+import logging
+import argparse
+import time
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Optional
+
 import yaml
-import zipfile, zlib, StringIO
 import requests
 import git
 
-def main():
-    options = get_options()
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-    congresses = options.get('congresses', None)
-    if not congresses:
-        print "Provide a --congresses option."
-        return
+CONGRESS_API_BASE = "https://api.congress.gov/v3"
+GOVINFO_API_BASE = "https://api.govinfo.gov"
+DEFAULT_CONFIG_PATH = "config.yml"
+DEFAULT_GITHUB_REPO = "git@github.com:unitedstates/congress-data.git"
+BILLS_PER_PAGE = 250
+REQUEST_TIMEOUT = 30
+RATE_LIMIT_SLEEP = 0.5  # seconds between paginated requests
 
-    for congress in congresses.split(","):
-        update_congress(congress.strip())
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-    exit(0)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
 
-def update_congress(congress):
-    config = yaml.safe_load(open("config.yml", 'r'))
-    repo_dir = os.path.join(config['repo'], str(congress)) # absolute path
-  
-    # remove repo_dir & replace
-    if os.path.isdir(repo_dir):
-        shutil.rmtree(repo_dir)
-    mkdir_p(repo_dir)
 
-    zipfile_name = "%s.zip" % congress
-    zipfile_path = "http://unitedstates.sunlightfoundation.com/congress/data/%s" % zipfile_name
-  
-    f = requests.get(zipfile_path)
-    if f.ok:
-  
-        github_repo = "git@github.com:unitedstates/congress-data.git"
-        # switch working directory to input data dir for relative globs
-        os.chdir(repo_dir)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-        # unzip file & extract
-        z = zipfile.ZipFile(StringIO.StringIO(f.content))
-        z.extractall(repo_dir)
+def current_congress_number() -> int:
+    """Calculate the current U.S. Congress number.
 
-        # initialize repo
-        g = git.cmd.Git(config['repo'])
-        g.init()
+    The 1st Congress convened in 1789. Each Congress lasts two years and
+    begins in January of odd-numbered years.
+    """
+    year = datetime.now().year
+    # Congress starts in odd years; if current year is even, use prior year
+    if year % 2 == 0:
+        year -= 1
+    return (year - 1789) // 2 + 1
 
-        # add files, commit, switch to branch and push to remote
-        g.add('%s' % str(congress))
-        g.commit(message="updating files for congress %s" % str(congress))
-        try:
-        	g.branch('gh-pages')
-        except:
-        	pass
-        g.checkout('gh-pages')
-        try:
-            g.remote("add", 'origin', github_repo)
-        except:
-            pass
-        g.push('origin', 'gh-pages')
 
-        print "%s bill & amendment data pushed to Github" % str(congress)
-    
+def ordinal(value: int) -> str:
+    """Convert an integer to its ordinal string (119 -> '119th')."""
+    value = int(value)
+    # Handle 11th, 12th, 13th edge cases
+    if value % 100 in (11, 12, 13):
+        suffix = "th"
+    elif value % 10 == 1:
+        suffix = "st"
+    elif value % 10 == 2:
+        suffix = "nd"
+    elif value % 10 == 3:
+        suffix = "rd"
     else:
-        print "Zip file not downloaded!"
+        suffix = "th"
+    return f"{value}{suffix}"
 
-def get_options():
-    options = {}
-    for arg in sys.argv[1:]:
-        if arg.startswith("--"):
-            if "=" in arg:
-                key, value = arg.split('=')
-            else:
-                key, value = arg, True
-            key = key.split("--")[1]
-            options[key.lower()] = value
-    return options
 
-# mkdir -p in python, from:
-# http://stackoverflow.com/questions/600268/mkdir-p-functionality-in-python
-def mkdir_p(path):
+def mkdir_p(path: str) -> None:
+    """Create a directory and all parents (equivalent to mkdir -p)."""
+    Path(path).mkdir(parents=True, exist_ok=True)
+
+
+def load_config(config_path: str = DEFAULT_CONFIG_PATH) -> Dict:
+    """Load and validate the YAML configuration file."""
+    config_file = Path(config_path)
+    if not config_file.exists():
+        raise FileNotFoundError(
+            f"Config file not found: {config_path}\n"
+            "Copy config.yml.example to config.yml and fill in your settings."
+        )
+    with open(config_file, "r") as f:
+        config = yaml.safe_load(f)
+
+    if not isinstance(config, dict):
+        raise ValueError("config.yml must contain a YAML mapping.")
+
+    missing = [k for k in ("repo", "github") if k not in config]
+    if missing:
+        raise ValueError(f"Missing required config fields: {', '.join(missing)}")
+
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Data fetching
+# ---------------------------------------------------------------------------
+
+def _congress_api_headers(api_key: Optional[str]) -> Dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["X-Api-Key"] = api_key
+    return headers
+
+
+def fetch_bills_congress_api(congress: str, api_key: Optional[str] = None) -> Optional[Dict]:
+    """Fetch all bills for *congress* from the Congress.gov API v3.
+
+    Returns a dict with keys ``congress``, ``bills``, ``total``, ``fetched_at``,
+    or *None* on failure.
+    """
+    url = f"{CONGRESS_API_BASE}/bill/{congress}"
+    params: Dict = {"format": "json", "limit": BILLS_PER_PAGE, "offset": 0}
+    if api_key:
+        params["api_key"] = api_key
+
+    log.info("Fetching bill list from Congress.gov API: %s", url)
+
+    all_bills: List[Dict] = []
+    page = 1
     try:
-        os.makedirs(path)
-    except OSError as exc: # Python >2.5
-        if exc.errno == errno.EEXIST:
-            pass
-        else:
+        while True:
+            log.debug("  Page %d (offset=%d)…", page, params["offset"])
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+
+            bills = data.get("bills", [])
+            if not bills:
+                break
+            all_bills.extend(bills)
+
+            pagination = data.get("pagination", {})
+            total = pagination.get("count", 0)
+            if len(all_bills) >= total:
+                break
+
+            params["offset"] += BILLS_PER_PAGE
+            page += 1
+            time.sleep(RATE_LIMIT_SLEEP)
+
+        log.info("Fetched %d bills for the %s Congress.", len(all_bills), ordinal(int(congress)))
+        return {
+            "congress": int(congress),
+            "ordinal": ordinal(int(congress)),
+            "total": len(all_bills),
+            "fetched_at": datetime.utcnow().isoformat() + "Z",
+            "source": "Congress.gov API v3",
+            "source_url": f"{CONGRESS_API_BASE}/bill/{congress}",
+            "bills": all_bills,
+        }
+    except requests.HTTPError as e:
+        log.error("HTTP error from Congress.gov API: %s", e)
+    except requests.RequestException as e:
+        log.error("Network error fetching from Congress.gov API: %s", e)
+    return None
+
+
+def fetch_amendments_congress_api(congress: str, api_key: Optional[str] = None) -> Optional[Dict]:
+    """Fetch all amendments for *congress* from the Congress.gov API v3."""
+    url = f"{CONGRESS_API_BASE}/amendment/{congress}"
+    params: Dict = {"format": "json", "limit": BILLS_PER_PAGE, "offset": 0}
+    if api_key:
+        params["api_key"] = api_key
+
+    log.info("Fetching amendment list from Congress.gov API: %s", url)
+
+    all_amendments: List[Dict] = []
+    page = 1
+    try:
+        while True:
+            log.debug("  Page %d (offset=%d)…", page, params["offset"])
+            response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            data = response.json()
+
+            amendments = data.get("amendments", [])
+            if not amendments:
+                break
+            all_amendments.extend(amendments)
+
+            pagination = data.get("pagination", {})
+            total = pagination.get("count", 0)
+            if len(all_amendments) >= total:
+                break
+
+            params["offset"] += BILLS_PER_PAGE
+            page += 1
+            time.sleep(RATE_LIMIT_SLEEP)
+
+        log.info("Fetched %d amendments for the %s Congress.", len(all_amendments), ordinal(int(congress)))
+        return {
+            "congress": int(congress),
+            "ordinal": ordinal(int(congress)),
+            "total": len(all_amendments),
+            "fetched_at": datetime.utcnow().isoformat() + "Z",
+            "source": "Congress.gov API v3",
+            "amendments": all_amendments,
+        }
+    except requests.HTTPError as e:
+        log.error("HTTP error from Congress.gov API (amendments): %s", e)
+    except requests.RequestException as e:
+        log.error("Network error fetching amendments: %s", e)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Git publishing
+# ---------------------------------------------------------------------------
+
+def publish_to_git(repo_dir: str, congress: str, github_repo: str, token: Optional[str]) -> bool:
+    """Commit updated data and push to the gh-pages branch on GitHub."""
+    g = git.cmd.Git(repo_dir)
+
+    try:
+        # Initialise if needed
+        if not (Path(repo_dir) / ".git").exists():
+            g.init()
+            log.debug("Initialised new git repo at %s", repo_dir)
+
+        # Stage & commit
+        g.add(".")
+        commit_msg = (
+            f"Update {ordinal(int(congress))} Congress data "
+            f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}]"
+        )
+        try:
+            g.commit(message=commit_msg)
+        except git.GitCommandError as e:
+            if "nothing to commit" in str(e).lower():
+                log.info("No changes to commit for Congress %s.", congress)
+                return True
             raise
 
-# adapted from http://code.activestate.com/recipes/576888-format-a-number-as-an-ordinal/
-def ordinal(value):
-    value = int(value)
-    if value % 100//10 != 1:
-        if value % 10 == 1:
-            ordval = u"%d%s" % (value, "st")
-    elif value % 10 == 2:
-        ordval = u"%d%s" % (value, "nd")
-    elif value % 10 == 3:
-        ordval = u"%d%s" % (value, "rd")
-    else:
-        ordval = u"%d%s" % (value, "th")
-    return ordval
+        # Ensure gh-pages branch exists
+        try:
+            g.branch("gh-pages")
+        except git.GitCommandError:
+            pass  # branch already exists
 
-if __name__ == '__main__':
+        g.checkout("gh-pages")
+
+        # Configure remote
+        try:
+            g.remote("add", "origin", github_repo)
+        except git.GitCommandError:
+            pass  # remote already set
+
+        # Optionally embed token into remote URL for HTTPS auth
+        if token and github_repo.startswith("https://"):
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(github_repo)
+            authed = parsed._replace(netloc=f"{token}@{parsed.hostname}")
+            github_repo = urlunparse(authed)
+            g.remote("set-url", "origin", github_repo)
+
+        g.push("origin", "gh-pages")
+        log.info("Pushed %s Congress data to GitHub (gh-pages).", ordinal(int(congress)))
+        return True
+
+    except git.GitCommandError as e:
+        log.error("Git operation failed: %s", e)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Core update logic
+# ---------------------------------------------------------------------------
+
+def update_congress(congress: str, config: Dict, dry_run: bool = False, amendments: bool = True) -> bool:
+    """Download and publish bill (and optionally amendment) data for one congress.
+
+    Returns True on success, False otherwise.
+    """
+    congress = str(congress).strip()
+    api_key = config.get("congress_api_key") or config.get("govinfo_api_key")
+    github_cfg = config.get("github", {})
+    github_repo = github_cfg.get("repo", DEFAULT_GITHUB_REPO)
+    token = github_cfg.get("token")
+    local_repo = config["repo"]
+    congress_dir = os.path.join(local_repo, congress)
+
+    log.info("=" * 60)
+    log.info("Processing %s Congress …", ordinal(int(congress)))
+
+    if dry_run:
+        log.info("[DRY RUN] Would update congress %s in %s", congress, congress_dir)
+        log.info("[DRY RUN] Would push to: %s", github_repo)
+        return True
+
+    # Fetch bills
+    bill_data = fetch_bills_congress_api(congress, api_key)
+    if not bill_data:
+        log.error("Failed to fetch bills for Congress %s. Skipping.", congress)
+        return False
+
+    # Optionally fetch amendments
+    amendment_data = None
+    if amendments:
+        amendment_data = fetch_amendments_congress_api(congress, api_key)
+
+    # Prepare directory
+    if os.path.isdir(congress_dir):
+        shutil.rmtree(congress_dir)
+    mkdir_p(congress_dir)
+
+    # Write bills.json
+    bills_file = os.path.join(congress_dir, "bills.json")
+    with open(bills_file, "w", encoding="utf-8") as f:
+        json.dump(bill_data, f, indent=2, ensure_ascii=False)
+    log.debug("Wrote %s", bills_file)
+
+    # Write individual bill files
+    bills_dir = os.path.join(congress_dir, "bills")
+    mkdir_p(bills_dir)
+    for bill in bill_data.get("bills", []):
+        bill_type = str(bill.get("type", "")).lower()
+        bill_number = bill.get("number", "")
+        if bill_type and bill_number:
+            fname = os.path.join(bills_dir, f"{bill_type}{bill_number}.json")
+            with open(fname, "w", encoding="utf-8") as f:
+                json.dump(bill, f, indent=2, ensure_ascii=False)
+
+    # Write amendments.json (if fetched)
+    if amendment_data:
+        amendments_file = os.path.join(congress_dir, "amendments.json")
+        with open(amendments_file, "w", encoding="utf-8") as f:
+            json.dump(amendment_data, f, indent=2, ensure_ascii=False)
+        log.debug("Wrote %s", amendments_file)
+
+    # Write metadata
+    meta = {
+        "congress": int(congress),
+        "ordinal": ordinal(int(congress)),
+        "bill_count": bill_data["total"],
+        "amendment_count": amendment_data["total"] if amendment_data else 0,
+        "last_updated": datetime.utcnow().isoformat() + "Z",
+        "source": "Congress.gov API v3",
+    }
+    meta_file = os.path.join(congress_dir, "metadata.json")
+    with open(meta_file, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    # Publish via Git
+    return publish_to_git(local_repo, congress, github_repo, token)
+
+
+def run_update(congresses: List[str], config: Dict, dry_run: bool = False, amendments: bool = True) -> None:
+    """Run an update cycle for all specified congress numbers."""
+    log.info("Starting update for congresses: %s", ", ".join(congresses))
+    success = 0
+    for congress in congresses:
+        if update_congress(congress, config, dry_run, amendments):
+            success += 1
+        else:
+            log.warning("Update failed for Congress %s.", congress)
+    log.info("Update cycle complete: %d/%d congresses updated.", success, len(congresses))
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+def start_scheduler(schedule_str: str, congresses: List[str], config: Dict,
+                    dry_run: bool, amendments: bool) -> None:
+    """Parse *schedule_str* and run recurring updates indefinitely."""
+    try:
+        import schedule as sched
+    except ImportError:
+        log.error("'schedule' package not installed. Run: pip install schedule")
+        sys.exit(1)
+
+    def job() -> None:
+        run_update(congresses, config, dry_run, amendments)
+
+    s = schedule_str.strip().lower()
+    if s == "hourly":
+        sched.every().hour.do(job)
+    elif s == "daily":
+        sched.every().day.do(job)
+    elif s == "weekly":
+        sched.every().week.do(job)
+    elif s.endswith("h") and s[:-1].isdigit():
+        sched.every(int(s[:-1])).hours.do(job)
+    elif s.endswith("m") and s[:-1].isdigit():
+        sched.every(int(s[:-1])).minutes.do(job)
+    else:
+        log.warning("Unrecognised schedule format '%s'. Running once only.", schedule_str)
+        return
+
+    log.info("Scheduler started (%s). Press Ctrl+C to stop.", schedule_str)
+    try:
+        while True:
+            sched.run_pending()
+            time.sleep(60)
+    except KeyboardInterrupt:
+        log.info("Scheduler stopped.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="publish",
+        description="Congress Publisher — download and publish U.S. Congressional data to GitHub",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  %(prog)s --current                      update the current congress
+  %(prog)s --congresses=119               update the 119th Congress
+  %(prog)s --congresses=117,118,119       update multiple congresses
+  %(prog)s --current --no-amendments      bills only (skip amendments)
+  %(prog)s --current --dry-run            preview without making any changes
+  %(prog)s --current --schedule=daily     auto-update once per day
+  %(prog)s --current --schedule=6h        auto-update every 6 hours
+  %(prog)s --current --schedule=30m       auto-update every 30 minutes
+
+data sources:
+  Congress.gov API v3  https://api.congress.gov/v3
+  GovInfo API          https://api.govinfo.gov
+
+get free API keys:
+  Congress.gov         https://api.congress.gov/sign-up/
+  GovInfo              https://api.data.gov/signup/
+""",
+    )
+
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument(
+        "--current",
+        action="store_true",
+        help=f"update the current congress (currently the {ordinal(current_congress_number())})",
+    )
+    src.add_argument(
+        "--congresses",
+        metavar="N[,N…]",
+        help="comma-separated list of congress numbers to update (e.g. 117,118,119)",
+    )
+
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_PATH,
+        metavar="FILE",
+        help=f"path to YAML config file (default: {DEFAULT_CONFIG_PATH})",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="show what would be done without writing or pushing anything",
+    )
+    parser.add_argument(
+        "--no-amendments",
+        action="store_true",
+        help="skip fetching and publishing amendment data",
+    )
+    parser.add_argument(
+        "--schedule",
+        metavar="INTERVAL",
+        help="keep running and re-fetch on a schedule (hourly|daily|weekly|Xh|Xm)",
+    )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="enable debug-level logging",
+    )
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # Determine target congresses
+    congresses: List[str] = []
+    if args.current:
+        congresses = [str(current_congress_number())]
+    elif args.congresses:
+        congresses = [c.strip() for c in args.congresses.split(",") if c.strip()]
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+    # Load configuration
+    try:
+        config = load_config(args.config)
+    except (FileNotFoundError, ValueError) as exc:
+        log.error("%s", exc)
+        sys.exit(1)
+
+    amendments = not args.no_amendments
+
+    # Run once immediately
+    run_update(congresses, config, args.dry_run, amendments)
+
+    # Then keep running on schedule if requested
+    if args.schedule:
+        start_scheduler(args.schedule, congresses, config, args.dry_run, amendments)
+
+
+if __name__ == "__main__":
     main()
